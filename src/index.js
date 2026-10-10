@@ -25,6 +25,17 @@ const MODES = {
 };
 const DEFAULT_MODE = 'balanced';
 
+// Tasks: non-chat jobs that need raw output (HTML, JSON, tool tags). They skip the core chat prompt
+// (no <plan>/<fq> tags), use the client's `system` text if sent, and never read prompt files.
+// maxTokens stays below the free-tier 8000 TPM limit.
+const TASKS = {
+  chart: { maxTokens: 5000, history: 0,    system: 'You are a data-visualization generator. Follow the user instructions exactly and output only what they ask for (raw HTML).' },
+  draw:  { maxTokens: 5000, history: 0,    system: 'You are an illustration generator. Follow the user instructions exactly and output only what they ask for (raw HTML with inline SVG).' },
+  quiz:  { maxTokens: 3500, history: 0,    system: 'You are a quiz generator. Output only valid JSON. No explanation, no markdown, no prose.' },
+  agent: { maxTokens: 5000, history: 3500, system: 'You are SUNSETAI, an advanced coding agent.' },
+  title: { maxTokens: 40,   history: 0,    system: 'You write short chat titles. Output only the title, nothing else.' }
+};
+
 // ---------------------------------------------------------------------------
 // On-demand prompt files: ./prompts/*.md (next to this file), loaded once at startup
 // ---------------------------------------------------------------------------
@@ -155,13 +166,14 @@ app.get(['/', '/health'], (req, res) => {
     version: '3.0.0',
     defaultMode: DEFAULT_MODE,
     modes: Object.fromEntries(Object.entries(MODES).map(([k, v]) => [k, v.model])),
+    tasks: Object.keys(TASKS),
     promptFiles: [...PROMPT_FILES.keys()],
     hasApiKey: Boolean(process.env.GROQ_API_KEY)
   });
 });
 
 // Build messages: hardcoded core prompt first, client system messages dropped, history trimmed
-function buildMessages(body, mode, useFiles) {
+function buildMessages(body, mode, useFiles, systemOverride) {
   const { prompt, messages } = body;
   let msgs = [];
   if (Array.isArray(messages) && messages.length > 0) {
@@ -183,7 +195,7 @@ function buildMessages(body, mode, useFiles) {
   }
   // Optional app context (user profile, preferences, response length, file/search notes) — appended to the system prompt
   const appCtx = typeof body.context === 'string' ? body.context.trim().slice(0, 3000) : '';
-  const system = (useFiles ? PROMPT_WITH_FILES : PROMPT_NO_FILES) +
+  const system = systemOverride ?? (useFiles ? PROMPT_WITH_FILES : PROMPT_NO_FILES) +
     (appCtx ? `\n\nAPP CONTEXT (user profile and preferences; follow unless they conflict with the core rules above):\n${appCtx}` : '');
   return [{ role: 'system', content: system }, ...kept];
 }
@@ -192,7 +204,7 @@ function buildOptions(body, groqMessages, mode) {
   const { temperature = 0.7, maxTokens, max_tokens } = body;
   const model = mode.model;
   const temp = Number(temperature);
-  const requested = Number(maxTokens || max_tokens) || mode.maxTokens;
+  const requested = mode.task ? mode.maxTokens : (Number(maxTokens || max_tokens) || mode.maxTokens);
   const options = {
     messages: groqMessages,
     model,
@@ -337,9 +349,17 @@ async function streamResponse(req, res, options, ctx) {
 const handleGenerate = async (req, res) => {
   try {
     const modeName = MODES[String(req.body?.mode || '').toLowerCase()] ? String(req.body.mode).toLowerCase() : DEFAULT_MODE;
-    const mode = MODES[modeName];
-    const ctx = { name: modeName, useFiles: mode.files && TOOLS.length > 0, fallback: mode.fallback, pace: mode.pace !== false };
-    const groqMessages = buildMessages(req.body || {}, mode, ctx.useFiles);
+    const taskName = TASKS[String(req.body?.task || '').toLowerCase()] ? String(req.body.task).toLowerCase() : null;
+    const task = taskName ? TASKS[taskName] : null;
+    // A task borrows the Fast model but has its own token budget, raw system prompt, no files, no pacing
+    const mode = task
+      ? { ...MODES.fast, task: true, maxTokens: task.maxTokens, history: task.history, files: false, pace: false }
+      : MODES[modeName];
+    const ctx = { name: taskName || modeName, useFiles: mode.files && TOOLS.length > 0, fallback: mode.fallback, pace: mode.pace !== false };
+    const taskSystem = task
+      ? ((typeof req.body.system === 'string' && req.body.system.trim()) ? req.body.system.trim().slice(0, 30000) : task.system)
+      : undefined;
+    const groqMessages = buildMessages(req.body || {}, mode, ctx.useFiles, taskSystem);
     if (!groqMessages) {
       return res.status(400).json({
         success: false,
