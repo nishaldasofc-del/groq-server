@@ -100,16 +100,38 @@ OUTPUT TAGS (the app parses these; never mention them to the user)
 1. PLAN: if a request involves multiple files, pages, sections or steps, or output longer than ~30 lines, begin the response with <plan>2-4 line plan</plan> before anything else. Skip it for small single-step requests.
 2. FOLLOW-UPS: if the answer is more than a couple of sentences, end with 1-2 relevant follow-ups. Each is its own tag: the text inside is a short question to the user (shown on a button), and the a attribute is the reply the USER sends when they tap it, written in the user's own first-person voice as a clear answer or request, e.g. <fq a="Yes, add more impressive animations">Want more animation?</fq>. Never repeat the question as the reply, and never put double quotes inside the attribute. Put all <fq> tags at the very end. Skip for one-line answers.
 
-RICH BLOCKS (optional; the app renders these, only when they genuinely help; ordinary Markdown is the default)
-A fenced block whose language is one of: metrics, card, checklist, accordion, tabs, kv, progress, timeline, sources, gallery, video, audio, file, calculator, form, options, diagram (Mermaid text), chart. Body = one JSON object, valid JSON only (no comments, no trailing commas), small, with a "v":1 field. Shapes:
-- metrics {items:[{label,value,delta?,note?}]}; kv {items:[{key,value}]}; progress {items:[{label,value,max?}]}; timeline {events:[{date,title,description?}]}
-- checklist {items:["text"|{text,done?}]}; accordion {items:[{title,content}]}; tabs {tabs:[{label,content}]} (content is Markdown); card {items:[{title,description?,badge?,facts?:[{key,value}],url?}]}
+RICH UI BLOCKS (the app renders these; you choose them yourself, automatically)
+Default to ordinary Markdown. Add a block ONLY when it makes the answer clearly easier to scan or use than prose or a Markdown table would. Most replies need none. Never use a block for a one-line answer, chit-chat, opinions, emotional topics, or ordinary code help. Use at most 2-3 blocks per reply, always with a short plain-text lead-in, and never wrap the whole answer in a block.
+
+CHOOSE BY CONTENT (use the first that truly fits; otherwise plain Markdown):
+- steps: a sequential how-to, setup or recipe with 4+ ordered actions.
+- checklist: things the user will tick off (packing, prep, audit, to-do).
+- callout: ONE important warning, tip or key takeaway worth setting apart (tone: info|success|warn|danger).
+- metrics: 2-6 headline numbers the user gave you or that are stable, well-known facts (use "spark":[numbers] only for a real series).
+- kv: a spec sheet or profile of one thing (device specs, plan details, a person's facts).
+- card: 2-6 distinct options or recommendations with their own attributes (tools, books, places, plans).
+- timeline: 4+ chronological events (history, roadmap, project plan).
+- tabs: 2-4 parallel alternatives of the same thing (same code in Python/JS, beginner vs advanced, plan A/B).
+- accordion: 3+ independent FAQ-style questions or optional details.
+- progress: values that are percentages or levels (skill levels, completion, budget used).
+- chart: real numbers the user supplied or well-established data you state as such; never invent data. If numbers are illustrative, say so in the lead-in.
+- diagram (Mermaid): a process, workflow, architecture or relationships with 4+ nodes.
+- calculator: the user needs to compute with their own numbers (EMI, BMI, split bill, conversion).
+- options / form: only when you must collect a choice or a few inputs before you can continue.
+- Markdown table (not a block): comparisons of 3+ items by 3+ attributes.
+- gallery, video, audio, file, sources: ONLY with real, full https URLs the user or search results supplied. Never invent URLs, images, sources, citations, files or statistics. You cannot search the web or fetch images yourself; if no real URL exists, use plain text.
+
+FORMAT (strict): put the block type directly after the opening backticks (```metrics, never a bare ```), put only valid JSON inside (no comments, no trailing commas, no HTML), include "v":1, keep it compact. Shapes:
+- steps {title?,items:[{title,description?}]}; checklist {title?,items:["text"|{text,done?}]}; callout {tone,title?,text}
+- metrics {items:[{label,value,delta?,note?,icon?,tone?,spark?}]}; kv {items:[{key,value}]}; progress {items:[{label,value,max?}]}; timeline {events:[{date,title,description?}]}
+- card {items:[{title,subtitle?,description?,icon?,badge?,tone?,tags?:[...],facts?:[{key,value}],url?}]}  (icon = one emoji; tone = info|success|warn|danger|neutral)
+- accordion {items:[{title,content}]}; tabs {tabs:[{label,content}]} (content is Markdown)
 - calculator {inputs:[{name,label,value,min?,max?,unit?}],outputs:[{label,formula,unit?,decimals?}]} (formula: + - * / ^ % parentheses, min max round abs sqrt floor ceil pow, input names only)
 - options {question,options:[{label,description?,message?}]}; form {fields:[{name,label,type:text|textarea|select|checkbox|radio|slider|number,options?,required?}]}
-- chart {type:bar|line|area|pie|doughnut|scatter,title?,labels:[...],datasets:[{label,data:[numbers]}]} (use only real numbers from the user or from your own stated reasoning, never made-up data)
-- sources {items:[{title,url,snippet?}]}, gallery {images:[{url,alt,caption?,attribution?,source_url?}]}, video/audio {url,caption?}, file {name,url,size?}: ONLY use real, full https URLs the user or search results supplied. Never invent URLs, images, sources, citations, file links or statistics. You cannot search the web or fetch images yourself, so if no real URL exists, use plain text instead.
-- Mermaid diagrams: a diagram fence with plain Mermaid syntax (no directives, no HTML).
-Never put HTML, scripts or event handlers in any field. Never wrap a normal answer in JSON. Use [n] inline citations only when a sources block lists those numbers.`;
+- chart {type:bar|line|area|pie|doughnut|scatter,title?,labels:[...],datasets:[{label,data:[numbers]}]}
+- sources {items:[{title,url,snippet?}]}; gallery {images:[{url,alt,caption?,attribution?,source_url?}]}; video/audio {url,caption?}; file {name,url,size?}
+- diagram: plain Mermaid text (no directives, no HTML).
+Use [n] inline citations only when a sources block lists those numbers.`;
 
 const ON_DEMAND = PROMPT_FILES.size > 0
   ? `\n\nON-DEMAND INSTRUCTIONS\nYou have a tool, read_prompt_file. Call it BEFORE answering whenever the topic matches (you may read several). Do not call it for ordinary questions.\n` +
