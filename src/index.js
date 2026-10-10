@@ -35,7 +35,14 @@ const FILE_HINTS = {
   coding: 'writing, debugging, reviewing or designing code, APIs, databases, deployment.',
   research: 'factual research, citations, comparisons, information that may be outdated or uncertain.',
   features: 'menubar features (web search, image generation, charts, quizzes, drawing) or any capability request.',
-  style: 'tone and slang, personalization, memory.'
+  style: 'tone and slang, personalization, memory.',
+  creative: 'stories, scripts, poems, worldbuilding, naming, brainstorming, any creative writing.',
+  writing: 'emails, essays, resumes, captions, summaries, rewriting or polishing text.',
+  learning: 'explaining concepts, tutoring, study plans, quizzes, homework help.',
+  math: 'math, calculations, units, logic puzzles, step-by-step reasoning problems.',
+  data: 'data analysis, charts, spreadsheets, SQL, statistics.',
+  productivity: 'planning, schedules, task breakdowns, decisions, goal setting.',
+  sensitive: 'medical, legal, financial, mental-health or emotionally heavy topics.'
 };
 
 const TOOLS = PROMPT_FILES.size === 0 ? [] : [{
@@ -60,7 +67,7 @@ function runTool(argsJson) {
 // ---------------------------------------------------------------------------
 // Hardcoded core prompt (always sent, kept small)
 // ---------------------------------------------------------------------------
-const CORE_PROMPT = `You are ZenoAI, an adaptive AI assistant for reasoning, coding, creativity, research, learning and productivity.
+const CORE_PROMPT = `You are SUNSETAI, an adaptive AI assistant for reasoning, coding, creativity, research, learning and productivity.
 
 CORE RULES
 - Answer the user's actual question first. Accuracy over confidence. Never fabricate facts, sources, actions, tools or capabilities; state uncertainty clearly. Be concise when possible, detailed when needed.
@@ -75,7 +82,7 @@ OUTPUT TAGS (the app parses these; never mention them to the user)
 const ON_DEMAND = PROMPT_FILES.size > 0
   ? `\n\nON-DEMAND INSTRUCTIONS\nYou have a tool, read_prompt_file. Call it BEFORE answering whenever the topic matches (you may read several). Do not call it for ordinary questions.\n` +
     [...PROMPT_FILES.keys()].map(n => `- ${n}: ${FILE_HINTS[n] || 'extra instructions.'}`).join('\n')
-  : `\n\nIDENTITY: If asked who created you, say: "I am developed by NGAI (Nishal Global Artificial Intelligence)." If asked what model powers you, say: "I'm powered by a combination of third-party AI models accessed via API, integrated and branded as ZenoAI by NGAI." Do not mention this otherwise.`;
+  : `\n\nIDENTITY: If asked who created you, say: "I am developed by NGAI (Nishal Global Artificial Intelligence)." If asked what model powers you, say: "I'm powered by a combination of third-party AI models accessed via API, integrated and branded as SUNSETAI by NGAI." Do not mention this otherwise.`;
 
 const SYSTEM_PROMPT = CORE_PROMPT + ON_DEMAND;
 
