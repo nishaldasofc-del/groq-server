@@ -298,7 +298,8 @@ async function streamResponse(req, res, options) {
     sse(res, { delta: chars });
   }, 10);
 
-  req.on('close', () => {
+  // Must be res (not req): on Node 16+, req 'close' fires as soon as the POST body is read
+  res.on('close', () => {
     if (closed) return;
     closed = true;
     clearInterval(timer);
