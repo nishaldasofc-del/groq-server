@@ -7,7 +7,7 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DEFAULT_MODEL = process.env.GROQ_DEFAULT_MODEL || 'llama-3.3-70b-versatile';
+const DEFAULT_MODEL = process.env.GROQ_DEFAULT_MODEL || 'openai/gpt-oss-120b';
 const DEFAULT_MAX_TOKENS = Number(process.env.DEFAULT_MAX_TOKENS) || 4096;
 const HARD_MAX_TOKENS = Number(process.env.HARD_MAX_TOKENS) || 8192;
 
@@ -247,12 +247,18 @@ function buildOptions(body, groqMessages) {
   const { model = DEFAULT_MODEL, temperature = 0.7, maxTokens, max_tokens } = body;
   const temp = Number(temperature);
   const requested = Number(maxTokens || max_tokens) || DEFAULT_MAX_TOKENS;
-  return {
+  const options = {
     messages: groqMessages,
     model,
     temperature: Number.isFinite(temp) ? Math.min(Math.max(temp, 0), 2) : 0.7,
     max_tokens: Math.min(Math.max(1, requested), HARD_MAX_TOKENS)
   };
+  // gpt-oss models are reasoning models: keep reasoning short for speed, don't send it back
+  if (String(model).startsWith('openai/gpt-oss')) {
+    options.reasoning_effort = process.env.REASONING_EFFORT || 'low';
+    options.include_reasoning = false;
+  }
+  return options;
 }
 
 function sse(res, obj) {
