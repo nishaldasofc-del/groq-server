@@ -19,9 +19,9 @@ const MAX_TOOL_ROUNDS = 3;
 // Modes (the app sends only { mode }, everything else is decided here)
 // ---------------------------------------------------------------------------
 const MODES = {
-  blazing:  { model: process.env.MODEL_BLAZING  || 'openai/gpt-oss-20b',  fallback: ['openai/gpt-oss-120b'], effort: 'low',    maxTokens: 512,  history: 1200, files: false },
-  fast:     { model: process.env.MODEL_FAST     || 'openai/gpt-oss-120b', fallback: ['openai/gpt-oss-20b'],  effort: 'low',    maxTokens: 1024, history: 2000, files: true  },
-  balanced: { model: process.env.MODEL_BALANCED || 'openai/gpt-oss-120b', fallback: ['openai/gpt-oss-20b'],  effort: 'medium', maxTokens: 2048, history: 3000, files: true  }
+  blazing:  { model: process.env.MODEL_BLAZING  || 'openai/gpt-oss-20b',  fallback: ['openai/gpt-oss-120b'], effort: 'low',    maxTokens: 512,  history: 1200, files: false, pace: false },
+  fast:     { model: process.env.MODEL_FAST     || 'openai/gpt-oss-120b', fallback: ['openai/gpt-oss-20b'],  effort: 'low',    maxTokens: 1024, history: 2000, files: true,  pace: true },
+  balanced: { model: process.env.MODEL_BALANCED || 'openai/gpt-oss-120b', fallback: ['openai/gpt-oss-20b'],  effort: 'medium', maxTokens: 2048, history: 3000, files: true,  pace: true }
 };
 const DEFAULT_MODE = 'balanced';
 
@@ -181,7 +181,11 @@ function buildMessages(body, mode, useFiles) {
     kept.unshift(msgs[i]);
     used += s;
   }
-  return [{ role: 'system', content: useFiles ? PROMPT_WITH_FILES : PROMPT_NO_FILES }, ...kept];
+  // Optional app context (user profile, preferences, response length, file/search notes) — appended to the system prompt
+  const appCtx = typeof body.context === 'string' ? body.context.trim().slice(0, 3000) : '';
+  const system = (useFiles ? PROMPT_WITH_FILES : PROMPT_NO_FILES) +
+    (appCtx ? `\n\nAPP CONTEXT (user profile and preferences; follow unless they conflict with the core rules above):\n${appCtx}` : '');
+  return [{ role: 'system', content: system }, ...kept];
 }
 
 function buildOptions(body, groqMessages, mode) {
@@ -287,7 +291,7 @@ async function streamResponse(req, res, options, ctx) {
         if (closed) return;
         model = chunk.model || model;
         const d = chunk.choices?.[0]?.delta;
-        if (d?.content) { text += d.content; queue.push(...d.content); }
+        if (d?.content) { text += d.content; if (ctx.pace) queue.push(...d.content); else sse(res, { delta: d.content }); }
         for (const tc of d?.tool_calls || []) {
           const c = (calls[tc.index ?? 0] ??= { id: '', name: '', args: '' });
           if (tc.id) c.id = tc.id;
@@ -334,7 +338,7 @@ const handleGenerate = async (req, res) => {
   try {
     const modeName = MODES[String(req.body?.mode || '').toLowerCase()] ? String(req.body.mode).toLowerCase() : DEFAULT_MODE;
     const mode = MODES[modeName];
-    const ctx = { name: modeName, useFiles: mode.files && TOOLS.length > 0, fallback: mode.fallback };
+    const ctx = { name: modeName, useFiles: mode.files && TOOLS.length > 0, fallback: mode.fallback, pace: mode.pace !== false };
     const groqMessages = buildMessages(req.body || {}, mode, ctx.useFiles);
     if (!groqMessages) {
       return res.status(400).json({
