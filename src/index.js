@@ -87,7 +87,7 @@ CORE RULES
 
 OUTPUT TAGS (the app parses these; never mention them to the user)
 1. PLAN: if a request involves multiple files, pages, sections or steps, or output longer than ~30 lines, begin the response with <plan>2-4 line plan</plan> before anything else. Skip it for small single-step requests.
-2. FOLLOW-UPS: if the answer is more than a couple of sentences, end with 1-2 relevant follow-up questions, each in its own tag, e.g. <fq>Want an example?</fq>. Put all <fq> tags at the very end, one short question per tag, nothing else inside. Skip for one-line answers.`;
+2. FOLLOW-UPS: if the answer is more than a couple of sentences, end with 1-2 relevant follow-ups. Each is its own tag: the text inside is a short question to the user (shown on a button), and the a attribute is the reply the USER sends when they tap it, written in the user's own first-person voice as a clear answer or request, e.g. <fq a="Yes, add more impressive animations">Want more animation?</fq>. Never repeat the question as the reply, and never put double quotes inside the attribute. Put all <fq> tags at the very end. Skip for one-line answers.`;
 
 const ON_DEMAND = PROMPT_FILES.size > 0
   ? `\n\nON-DEMAND INSTRUCTIONS\nYou have a tool, read_prompt_file. Call it BEFORE answering whenever the topic matches (you may read several). Do not call it for ordinary questions.\n` +
