@@ -16,6 +16,16 @@ const HARD_MAX_TOKENS = Number(process.env.HARD_MAX_TOKENS) || 8192;
 const MAX_TOOL_ROUNDS = 3;
 
 // ---------------------------------------------------------------------------
+// Modes (the app sends only { mode }, everything else is decided here)
+// ---------------------------------------------------------------------------
+const MODES = {
+  blazing:  { model: process.env.MODEL_BLAZING  || 'openai/gpt-oss-20b',  fallback: ['openai/gpt-oss-120b'], effort: 'low',    maxTokens: 512,  history: 1200, files: false },
+  fast:     { model: process.env.MODEL_FAST     || 'openai/gpt-oss-120b', fallback: ['openai/gpt-oss-20b'],  effort: 'low',    maxTokens: 1024, history: 2000, files: true  },
+  balanced: { model: process.env.MODEL_BALANCED || 'openai/gpt-oss-120b', fallback: ['openai/gpt-oss-20b'],  effort: 'medium', maxTokens: 2048, history: 3000, files: true  }
+};
+const DEFAULT_MODE = 'balanced';
+
+// ---------------------------------------------------------------------------
 // On-demand prompt files: ./prompts/*.md (next to this file), loaded once at startup
 // ---------------------------------------------------------------------------
 const PROMPTS_DIR = process.env.PROMPTS_DIR ||
@@ -84,7 +94,10 @@ const ON_DEMAND = PROMPT_FILES.size > 0
     [...PROMPT_FILES.keys()].map(n => `- ${n}: ${FILE_HINTS[n] || 'extra instructions.'}`).join('\n')
   : `\n\nIDENTITY: If asked who created you, say: "I am developed by NGAI (Nishal Global Artificial Intelligence)." If asked what model powers you, say: "I'm powered by a combination of third-party AI models accessed via API, integrated and branded as SUNSETAI by NGAI." Do not mention this otherwise.`;
 
-const SYSTEM_PROMPT = CORE_PROMPT + ON_DEMAND;
+const FALLBACK_IDENTITY = `\n\nIDENTITY: If asked who created you, say: "I am developed by NGAI (Nishal Global Artificial Intelligence)." If asked about NGAI, you may add: "NGAI is Nishal's dream company." If asked what model powers you, say: "I'm powered by a combination of third-party AI models accessed via API, integrated and branded as SUNSETAI by NGAI." Do not mention this otherwise.`;
+
+const PROMPT_WITH_FILES = CORE_PROMPT + ON_DEMAND;   // Fast / Balanced
+const PROMPT_NO_FILES = CORE_PROMPT + FALLBACK_IDENTITY; // Blazing (no extra round trip)
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -113,8 +126,8 @@ function retryAfterMs(e) {
   return 1000;
 }
 
-async function createWithRetry(options) {
-  const models = [options.model, ...FALLBACK_MODELS.filter(m => m !== options.model)];
+async function createWithRetry(options, fallbacks = FALLBACK_MODELS) {
+  const models = [options.model, ...fallbacks.filter(m => m !== options.model)];
   let lastErr;
   for (const model of models) {
     const opts = { ...options, model };
@@ -140,15 +153,15 @@ app.get(['/', '/health'], (req, res) => {
     status: 'ok',
     service: 'Groq AI Server',
     version: '3.0.0',
-    defaultModel: DEFAULT_MODEL,
-    defaultMaxTokens: DEFAULT_MAX_TOKENS,
+    defaultMode: DEFAULT_MODE,
+    modes: Object.fromEntries(Object.entries(MODES).map(([k, v]) => [k, v.model])),
     promptFiles: [...PROMPT_FILES.keys()],
     hasApiKey: Boolean(process.env.GROQ_API_KEY)
   });
 });
 
 // Build messages: hardcoded core prompt first, client system messages dropped, history trimmed
-function buildMessages(body) {
+function buildMessages(body, mode, useFiles) {
   const { prompt, messages } = body;
   let msgs = [];
   if (Array.isArray(messages) && messages.length > 0) {
@@ -158,7 +171,7 @@ function buildMessages(body) {
   }
   if (msgs.length === 0) return null;
 
-  const budget = Number(process.env.HISTORY_TOKEN_BUDGET) || 2500;
+  const budget = Number(process.env.HISTORY_TOKEN_BUDGET) || mode.history;
   const size = m => Math.ceil((typeof m.content === 'string' ? m.content : JSON.stringify(m.content)).length / 4);
   const kept = [];
   let used = 0;
@@ -168,13 +181,14 @@ function buildMessages(body) {
     kept.unshift(msgs[i]);
     used += s;
   }
-  return [{ role: 'system', content: SYSTEM_PROMPT }, ...kept];
+  return [{ role: 'system', content: useFiles ? PROMPT_WITH_FILES : PROMPT_NO_FILES }, ...kept];
 }
 
-function buildOptions(body, groqMessages) {
-  const { model = DEFAULT_MODEL, temperature = 0.7, maxTokens, max_tokens } = body;
+function buildOptions(body, groqMessages, mode) {
+  const { temperature = 0.7, maxTokens, max_tokens } = body;
+  const model = mode.model;
   const temp = Number(temperature);
-  const requested = Number(maxTokens || max_tokens) || DEFAULT_MAX_TOKENS;
+  const requested = Number(maxTokens || max_tokens) || mode.maxTokens;
   const options = {
     messages: groqMessages,
     model,
@@ -182,7 +196,7 @@ function buildOptions(body, groqMessages) {
     max_tokens: Math.min(Math.max(1, requested), HARD_MAX_TOKENS)
   };
   if (String(model).startsWith('openai/gpt-oss')) {
-    options.reasoning_effort = process.env.REASONING_EFFORT || 'low';
+    options.reasoning_effort = mode.effort;
     options.include_reasoning = false;
   }
   return options;
@@ -193,13 +207,13 @@ function sse(res, obj) {
 }
 
 // ---- Non-streaming with tool loop ----
-async function completeWithTools(options) {
+async function completeWithTools(options, ctx) {
   const messages = [...options.messages];
   const toolsRead = [];
   let completion;
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-    const useTools = TOOLS.length > 0 && round < MAX_TOOL_ROUNDS;
-    completion = await createWithRetry({ ...options, messages, ...(useTools && { tools: TOOLS, tool_choice: 'auto' }) });
+    const useTools = ctx.useFiles && round < MAX_TOOL_ROUNDS;
+    completion = await createWithRetry({ ...options, messages, ...(useTools && { tools: TOOLS, tool_choice: 'auto' }) }, ctx.fallback);
     const msg = completion.choices[0]?.message;
     if (!msg?.tool_calls?.length) break;
     messages.push({ role: 'assistant', content: msg.content ?? null, tool_calls: msg.tool_calls });
@@ -213,7 +227,7 @@ async function completeWithTools(options) {
 }
 
 // ---- Smooth character-by-character streaming (SSE) with tool loop ----
-async function streamResponse(req, res, options) {
+async function streamResponse(req, res, options, ctx) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -234,7 +248,7 @@ async function streamResponse(req, res, options) {
     if (closed) return;
     closed = true;
     clearInterval(timer);
-    sse(res, { done: true, model, usage });
+    sse(res, { done: true, mode: ctx.name, model, usage });
     res.write('data: [DONE]\n\n');
     res.end();
   };
@@ -261,11 +275,11 @@ async function streamResponse(req, res, options) {
     const messages = [...options.messages];
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-      const useTools = TOOLS.length > 0 && round < MAX_TOOL_ROUNDS;
+      const useTools = ctx.useFiles && round < MAX_TOOL_ROUNDS;
       stream = await createWithRetry({
         ...options, messages, stream: true,
         ...(useTools && { tools: TOOLS, tool_choice: 'auto' })
-      });
+      }, ctx.fallback);
 
       const calls = {};
       let text = '';
@@ -318,7 +332,10 @@ async function streamResponse(req, res, options) {
 
 const handleGenerate = async (req, res) => {
   try {
-    const groqMessages = buildMessages(req.body || {});
+    const modeName = MODES[String(req.body?.mode || '').toLowerCase()] ? String(req.body.mode).toLowerCase() : DEFAULT_MODE;
+    const mode = MODES[modeName];
+    const ctx = { name: modeName, useFiles: mode.files && TOOLS.length > 0, fallback: mode.fallback };
+    const groqMessages = buildMessages(req.body || {}, mode, ctx.useFiles);
     if (!groqMessages) {
       return res.status(400).json({
         success: false,
@@ -326,15 +343,15 @@ const handleGenerate = async (req, res) => {
       });
     }
 
-    const options = buildOptions(req.body, groqMessages);
+    const options = buildOptions(req.body, groqMessages, mode);
     const wantStream = req.body.stream !== false && req.query.stream !== 'false';
 
     if (wantStream) {
       getGroqClient(); // fail fast with a proper JSON error if the key is missing
-      return await streamResponse(req, res, options);
+      return await streamResponse(req, res, options, ctx);
     }
 
-    const { completion, toolsRead } = await completeWithTools(options);
+    const { completion, toolsRead } = await completeWithTools(options, ctx);
     const responseText = completion.choices[0]?.message?.content || '';
 
     if (req.query.details === 'true' || req.body.includeDetails) {
