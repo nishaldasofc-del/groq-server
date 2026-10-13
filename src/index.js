@@ -17,6 +17,8 @@ const MAX_TOOL_ROUNDS = 3;
 // Provider tokens-per-minute cap that one request (prompt + max_tokens) must fit in. Groq free tier is 8000;
 // raise TPM_BUDGET on paid tiers. Rich UI blocks are long JSON, so history is trimmed before the answer is.
 const TPM_BUDGET = Number(process.env.TPM_BUDGET) || 7600;
+// Max tokens of attached-file text (e.g. an extracted ZIP) the client may send per request in `body.files`
+const FILES_TOKEN_BUDGET = Number(process.env.FILES_TOKEN_BUDGET) || 2500;
 
 // ---------------------------------------------------------------------------
 // Modes (the app sends only { mode }, everything else is decided here)
@@ -246,7 +248,8 @@ function buildMessages(body, mode, useFiles, systemOverride) {
   if (msgs.length === 0) return null;
 
   const wantOut = Math.min(Number(body.maxTokens || body.max_tokens) || mode.maxTokens, HARD_MAX_TOKENS);
-  const sysTok = Math.ceil(((systemOverride ?? (useFiles ? PROMPT_WITH_FILES : PROMPT_NO_FILES)).length + (typeof body.context === 'string' ? Math.min(body.context.length, 3000) : 0)) / 4);
+  const filesTxt = (!systemOverride && typeof body.files === 'string') ? body.files.trim().slice(0, FILES_TOKEN_BUDGET * 4) : '';
+  const sysTok = Math.ceil(((systemOverride ?? (useFiles ? PROMPT_WITH_FILES : PROMPT_NO_FILES)).length + filesTxt.length + (typeof body.context === 'string' ? Math.min(body.context.length, 3000) : 0)) / 4);
   const budget = Number(process.env.HISTORY_TOKEN_BUDGET) || (mode.task ? mode.history : Math.min(mode.history, Math.max(800, TPM_BUDGET - sysTok - wantOut)));
   const size = m => Math.ceil((typeof m.content === 'string' ? m.content : JSON.stringify(m.content)).length / 4);
   const kept = [];
@@ -260,7 +263,8 @@ function buildMessages(body, mode, useFiles, systemOverride) {
   // Optional app context (user profile, preferences, response length, file/search notes) — appended to the system prompt
   const appCtx = typeof body.context === 'string' ? body.context.trim().slice(0, 3000) : '';
   const system = systemOverride ?? (useFiles ? PROMPT_WITH_FILES : PROMPT_NO_FILES) +
-    (appCtx ? `\n\nAPP CONTEXT (user profile and preferences; follow unless they conflict with the core rules above):\n${appCtx}` : '');
+    (appCtx ? `\n\nAPP CONTEXT (user profile and preferences; follow unless they conflict with the core rules above):\n${appCtx}` : '') +
+    (filesTxt ? `\n\nATTACHED FILES (the user's uploaded archive/files, already extracted for you and present in every turn; read and use them directly — never ask the user to re-upload; long files may be truncated, say so if relevant):\n${filesTxt}` : '');
   return [{ role: 'system', content: system }, ...kept];
 }
 
