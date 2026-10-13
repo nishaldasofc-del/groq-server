@@ -15,11 +15,11 @@ const DEFAULT_MAX_TOKENS = Number(process.env.DEFAULT_MAX_TOKENS) || 1024;
 const HARD_MAX_TOKENS = Number(process.env.HARD_MAX_TOKENS) || 8192;
 const MAX_TOOL_ROUNDS = 4;
 // ---- Automatic web search: the model decides when to call the web_search tool ----
-const SEARCH_URL = process.env.SEARCH_URL || 'https://tavily-mcp-sse.onrender.com/search'; // Tavily-compatible POST { query, max_results, include_answer }
+const SEARCH_URL = process.env.SEARCH_URL || (process.env.TAVILY_API_KEY ? 'https://api.tavily.com/search' : 'https://tavily-mcp-sse.onrender.com/search'); // direct Tavily is much faster than the sleeping Render proxy // Tavily-compatible POST { query, max_results, include_answer }
 const SEARCH_API_KEY = process.env.SEARCH_API_KEY || process.env.TAVILY_API_KEY || ''; // optional; sent as Bearer if set
 const SEARCH_ENABLED = process.env.AUTO_SEARCH !== 'off' && Boolean(SEARCH_URL);
 const MAX_SEARCHES = Number(process.env.MAX_SEARCHES_PER_REQUEST) || 2;
-const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS) || 12000;
+const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS) || 10000;
 // Provider tokens-per-minute cap that one request (prompt + max_tokens) must fit in. Groq free tier is 8000;
 // raise TPM_BUDGET on paid tiers. Rich UI blocks are long JSON, so history is trimmed before the answer is.
 const TPM_BUDGET = Number(process.env.TPM_BUDGET) || 7600;
@@ -125,6 +125,7 @@ async function runSearchTool(argsJson, ctx) {
     return { query, content: 'Search limit reached for this reply. Answer with what you already have and say what is unverified.', sources: [], images: [], skipped: true };
   }
   ctx.searches++;
+  ctx.seen ??= new Map();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
   try {
@@ -139,7 +140,16 @@ async function runSearchTool(argsJson, ctx) {
     const results = (raw.results || []).slice(0, 5);
     if (!results.length) return { query, content: `No web results found for "${query}". Say you could not verify this.`, sources: [], images: [] };
     const clean = t => String(t || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
-    const sources = results.map(x => ({ title: clean(x.title).slice(0, 120), url: x.url || '', snippet: clean(x.content || x.snippet).slice(0, 180) }));
+    // Global numbering across all searches in this reply: [n] in the answer == position in the client's source list
+    const sources = [];
+    const nums = results.map(x => {
+      const u = x.url || '';
+      if (ctx.seen.has(u)) return ctx.seen.get(u);
+      const n = ctx.seen.size + 1;
+      ctx.seen.set(u, n);
+      sources.push({ title: clean(x.title).slice(0, 120), url: u, snippet: clean(x.content || x.snippet).slice(0, 180) });
+      return n;
+    });
     const seen = new Set();
     const images = (Array.isArray(raw.images) ? raw.images : [])
       .map(im => typeof im === 'string' ? { url: im } : { url: im?.url, alt: im?.description })
@@ -147,8 +157,8 @@ async function runSearchTool(argsJson, ctx) {
       .slice(0, 4).map(im => ({ url: im.url, alt: String(im.alt || query).slice(0, 200) }));
     let content = `WEB SEARCH RESULTS for "${query}" (retrieved ${new Date().toISOString().slice(0, 10)})\n`;
     if (raw.answer) content += `Direct answer: ${clean(raw.answer).slice(0, 500)}\n`;
-    results.forEach((x, i) => { content += `\n[${i + 1}] ${clean(x.title)}\n${clean(x.content || x.snippet).slice(0, 320)}\nURL: ${x.url}\n`; });
-    content += '\nUse these to answer. Cite sources by name. If they conflict or do not answer the question, say so.';
+    results.forEach((x, i) => { content += `\n[${nums[i]}] ${clean(x.title)}\n${clean(x.content || x.snippet).slice(0, 320)}\nURL: ${x.url}\n`; });
+    content += '\nAnswer from these results. Cite with the bracket numbers exactly like [1] or [2] (plain ASCII square brackets). If they conflict or do not answer the question, say so.';
     return { query, content, sources, images };
   } catch (e) {
     return { query, content: `Web search is unavailable right now (${e.name === 'AbortError' ? 'timeout' : e.message}). Answer from your own knowledge and clearly say it could not be verified live.`, sources: [], images: [], failed: true };
@@ -159,12 +169,40 @@ async function runSearchTool(argsJson, ctx) {
 
 // Execute one tool call. Returns { content, event? , sources?, images? }
 async function runTool(call, ctx) {
+  if (ctx.exhausted) return { content: 'Tool budget exhausted. Do not call any more tools. Write the final answer now with what you have.', name: call.name };
   if (call.name === 'web_search') {
     const r = await runSearchTool(call.args, ctx);
     return { content: r.content, query: r.query, sources: r.sources, images: r.images, failed: r.failed, isSearch: true };
   }
   const r = runPromptTool(call.args);
   return { content: r.content, name: r.name };
+}
+
+// ---- Prefetch: obviously time-sensitive questions are searched BEFORE the first model call (saves a full LLM round trip) ----
+const TIME_SENSITIVE = /\b(latest|newest|current(ly)?|today|tonight|yesterday|now|right now|recent(ly)?|news|price|cost of|worth|score|won|winner|results?|final|live|weather|stock|rate|version|release[ds]?|update[ds]?|trending|who is|who's|ceo|president|prime minister|202[4-9]|this (week|month|year)|search|check|verify|look ?up|google|is it true)\b/i;
+function prefetchQuery(msgs) {
+  const users = msgs.filter(m => m.role === 'user' && typeof m.content === 'string');
+  const last = (users.at(-1)?.content || '').replace(/\s+/g, ' ').trim();
+  if (!last || last.length > 400 || /```/.test(last) || !TIME_SENSITIVE.test(last)) return null;
+  const words = last.split(' ').length;
+  if (words < 3) return null;
+  // short follow-ups ("no this is old version") need the previous question for context
+  const prev = users.length > 1 ? users.at(-2).content.replace(/\s+/g, ' ').trim().slice(0, 200) : '';
+  return (words < 8 && prev ? `${prev} ${last}` : last).slice(0, 250);
+}
+// Run the prefetch search and splice it into the conversation as if the model had called web_search itself
+async function prefetchSearch(messages, ctx, onEvent) {
+  if (!ctx.search || ctx.task) return;
+  const query = prefetchQuery(messages.filter(m => m.role !== 'system'));
+  if (!query) return;
+  onEvent?.({ search: { state: 'start', query } });
+  const r = await runSearchTool(JSON.stringify({ query }), ctx);
+  onEvent?.({ search: { state: r.failed ? 'failed' : 'done', query }, sources: r.sources, images: r.images || [] });
+  messages.push(
+    { role: 'assistant', content: null, tool_calls: [{ id: 'pre_search_1', type: 'function', function: { name: 'web_search', arguments: JSON.stringify({ query }) } }] },
+    { role: 'tool', tool_call_id: 'pre_search_1', content: r.content }
+  );
+  return r;
 }
 
 // After tool results are added the prompt grew: keep prompt + max_tokens inside the provider TPM cap
@@ -258,10 +296,11 @@ const FALLBACK_IDENTITY = `\n\nIDENTITY: If asked who created you, say: "I am de
 const SEARCH_POLICY = () => `
 
 LIVE WEB SEARCH (you have a web_search tool; today is ${new Date().toISOString().slice(0, 10)})
-- You decide when to search; the user does not have to ask. Search BEFORE answering when the question depends on anything current or changeable (news, prices, scores, releases, versions, who currently holds a role, laws/rules, weather, schedules, "latest/today/now/this year"), asks about a specific person, company, product or event you are not sure about, or when you doubt or cannot confirm a fact you were about to state.
+- You decide when to search; the user does not have to ask. Search BEFORE answering when the question depends on anything current or changeable (news, prices, scores, releases, versions, who currently holds a role, laws/rules, weather, schedules, "latest/today/now/this year"), asks about a specific person, company, product or event you are not sure about, or when you doubt or cannot confirm a fact you were about to state. If a search result for this question is already in the conversation, use it instead of searching again, unless it clearly missed (then search once more with a better query).
 - Do NOT search for greetings, chit-chat, opinions, creative writing, math, ordinary coding help, rewriting the user's own text, or stable well-known facts.
-- Use a short specific query. One search is usually enough; a second only if the first missed. If the user asks for sources or says "check", "verify", "look up" or "search", always search.
-- Answer from the results, name the source in prose, and never invent URLs. If the results are thin or conflicting, say so. If search fails, say the answer is unverified. Never claim you searched when you did not. The sources and images you were given may be used in sources/gallery blocks; real URLs from results are allowed.`;
+- Write a short specific query. One search is usually enough; a second only if the first missed. If the user pushes back ("this is old", "are you sure"), search again with a sharper query instead of repeating yourself.
+- ANSWER QUALITY AFTER SEARCHING: do not reply with one line. Give a complete, useful answer: the direct answer first, then the key details (dates, numbers, names, what changed, context, caveats), 120-300 words unless the question is truly tiny. Use a fitting RICH UI BLOCK (table, metrics, timeline, card, steps, callout) when the facts have structure. Say what is uncertain or conflicting between sources.
+- CITATIONS: cite with plain ASCII brackets matching the result numbers, like [1] or [2]; never use 【】 or other bracket styles. The app automatically shows source cards and images under your answer, so DO NOT write your own sources, gallery or link-list block and do not paste raw URLs. Only if search failed or returned nothing, say plainly the answer is unverified. Never claim you searched when you did not.`;
 
 const PROMPT_WITH_FILES = CORE_PROMPT + ON_DEMAND;   // Fast / Balanced
 const PROMPT_NO_FILES = CORE_PROMPT + FALLBACK_IDENTITY; // Blazing (no extra round trip)
@@ -393,9 +432,13 @@ async function completeWithTools(options, ctx) {
   const sources = [];
   const tools = toolsFor(ctx);
   let completion;
-  for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-    const useTools = tools.length > 0 && round < MAX_TOOL_ROUNDS;
-    completion = await createWithRetry({ ...refit(options, messages, ctx), messages, ...(useTools && { tools, tool_choice: 'auto' }) }, ctx.fallback);
+  const pre = await prefetchSearch(messages, ctx);
+  if (pre) { sources.push(...pre.sources); toolsRead.push(`web_search:${pre.query}`); }
+  for (let round = 0; round <= MAX_TOOL_ROUNDS + 2; round++) {
+    // Keep tools attached on every round (providers 400 if the model calls a tool that was not offered);
+    // once the budget is spent, tool calls just return "answer now".
+    ctx.exhausted = round >= MAX_TOOL_ROUNDS;
+    completion = await createWithRetry({ ...refit(options, messages, ctx), messages, ...(tools.length > 0 && { tools, tool_choice: 'auto' }) }, ctx.fallback);
     const msg = completion.choices[0]?.message;
     if (!msg?.tool_calls?.length) break;
     messages.push({ role: 'assistant', content: msg.content ?? null, tool_calls: msg.tool_calls });
@@ -429,6 +472,14 @@ async function streamResponse(req, res, options, ctx) {
   let stream = null;
   const tools = toolsFor(ctx);
   const seenUrls = new Set();
+  // gpt-oss writes citations as 【1†source】; the app expects plain [1]. Hold a split marker until it closes.
+  let citePend = '';
+  const cleanCites = t => {
+    let x = citePend + t; citePend = '';
+    const i = x.lastIndexOf('【');
+    if (i !== -1 && x.indexOf('】', i) === -1 && x.length - i < 40) { citePend = x.slice(i); x = x.slice(0, i); }
+    return x.replace(/【(\d{1,2})(?:[†:][^】]*)?】/g, '[$1]').replace(/[【】]/g, '');
+  };
 
   const finish = () => {
     if (closed) return;
@@ -459,12 +510,17 @@ async function streamResponse(req, res, options, ctx) {
 
   try {
     const messages = [...options.messages];
+    const pre = await prefetchSearch(messages, ctx, ev => {
+      if (ev.sources) ev.sources.forEach(x => seenUrls.add(x.url));
+      sse(res, ev);
+    });
+    if (closed) return;
 
-    for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-      const useTools = tools.length > 0 && round < MAX_TOOL_ROUNDS;
+    for (let round = 0; round <= MAX_TOOL_ROUNDS + 2; round++) {
+      ctx.exhausted = round >= MAX_TOOL_ROUNDS; // tools stay attached; exhausted calls just return "answer now"
       stream = await createWithRetry({
         ...refit(options, messages, ctx), messages, stream: true,
-        ...(useTools && { tools, tool_choice: 'auto' })
+        ...(tools.length > 0 && { tools, tool_choice: 'auto' })
       }, ctx.fallback);
 
       const calls = {};
@@ -474,7 +530,11 @@ async function streamResponse(req, res, options, ctx) {
         model = chunk.model || model;
         const d = chunk.choices?.[0]?.delta;
         if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
-        if (d?.content) { text += d.content; if (ctx.pace) queue.push(...d.content); else sse(res, { delta: d.content }); }
+        if (d?.content) {
+          const c = cleanCites(d.content);
+          text += c;
+          if (c) { if (ctx.pace) queue.push(...c); else sse(res, { delta: c }); }
+        }
         for (const tc of d?.tool_calls || []) {
           const c = (calls[tc.index ?? 0] ??= { id: '', name: '', args: '' });
           if (tc.id) c.id = tc.id;
@@ -491,6 +551,7 @@ async function streamResponse(req, res, options, ctx) {
         }
       }
 
+      if (citePend) { const c = citePend; citePend = ''; text += c; if (ctx.pace) queue.push(...c); else sse(res, { delta: c }); }
       const list = Object.values(calls).filter(c => c.name);
       if (list.length === 0) break;
 
