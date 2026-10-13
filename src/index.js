@@ -44,6 +44,7 @@ const TASKS = {
   draw:  { maxTokens: 5000, history: 0,    system: 'You are an illustration generator. Follow the user instructions exactly and output only what they ask for (raw HTML with inline SVG).' },
   quiz:  { maxTokens: 3500, history: 0,    system: 'You are a quiz generator. Output only valid JSON. No explanation, no markdown, no prose.' },
   agent: { maxTokens: 5000, history: 3500, system: 'You are SUNSETAI, an advanced coding agent.' },
+  voice: { maxTokens: 512,  history: 3500, model: process.env.MODEL_VOICE || 'llama-3.3-70b-versatile', system: 'You are SunsetAI, an intelligent voice assistant by NGAI. Be conversational and concise: 2-4 sentences unless detail is needed. No markdown in responses. Speak naturally as if in conversation.' },
   title: { maxTokens: 40,   history: 0,    system: 'You write short chat titles. Output only the title, nothing else.' }
 };
 
@@ -362,6 +363,7 @@ app.get(['/', '/health'], (req, res) => {
     defaultMode: DEFAULT_MODE,
     modes: Object.fromEntries(Object.entries(MODES).map(([k, v]) => [k, v.model])),
     tasks: Object.keys(TASKS),
+    voice: { stt: STT_MODEL, tts: TTS_MODEL },
     promptFiles: [...PROMPT_FILES.keys()],
     richBlocks: 1,
     hasApiKey: Boolean(process.env.GROQ_API_KEY)
@@ -595,7 +597,7 @@ const handleGenerate = async (req, res) => {
     const task = taskName ? TASKS[taskName] : null;
     // A task borrows the Fast model but has its own token budget, raw system prompt, no files, no pacing
     const mode = task
-      ? { ...MODES.fast, task: true, maxTokens: task.maxTokens, history: task.history, files: false, pace: false }
+      ? { ...MODES.fast, ...(task.model && { model: task.model }), task: true, maxTokens: task.maxTokens, history: task.history, files: false, pace: false }
       : MODES[modeName];
     // Auto web search: chat only (not tasks), unless the client already searched (manual toggle) or opts out with search:false
     const search = SEARCH_ENABLED && !task && req.body?.search !== false;
@@ -646,6 +648,60 @@ const handleGenerate = async (req, res) => {
 };
 
 app.post(['/api/generate', '/api/chat', '/'], handleGenerate);
+
+// ---------------------------------------------------------------------------
+// Voice: speech-to-text and text-to-speech proxies (the Groq key stays on the server)
+// ---------------------------------------------------------------------------
+const GROQ_REST = (process.env.GROQ_BASE_URL || 'https://api.groq.com').replace(/\/+$/, '') + '/openai/v1';
+const STT_MODEL = process.env.STT_MODEL || 'whisper-large-v3-turbo';
+const TTS_MODEL = process.env.TTS_MODEL || 'canopylabs/orpheus-v1-english';
+const ORPHEUS_VOICES = ['hannah', 'diana', 'autumn', 'austin', 'daniel', 'troy'];
+
+// Raw audio body (the browser posts the recorded Blob as-is); ?ext=webm|mp4|ogg|wav picks the file extension
+app.post('/api/stt', express.raw({ type: () => true, limit: '25mb' }), async (req, res) => {
+  try {
+    if (!process.env.GROQ_API_KEY) return res.status(401).json({ success: false, error: 'GROQ_API_KEY environment variable is not set.' });
+    if (!Buffer.isBuffer(req.body) || req.body.length < 200) return res.status(400).json({ success: false, error: 'No audio received.' });
+    const ext = /^[a-z0-9]{2,5}$/i.test(String(req.query.ext || '')) ? String(req.query.ext).toLowerCase() : 'webm';
+    const form = new FormData();
+    form.append('file', new Blob([req.body], { type: req.get('content-type') || 'audio/webm' }), `audio.${ext}`);
+    form.append('model', STT_MODEL);
+    form.append('response_format', 'json');
+    if (req.query.lang) form.append('language', String(req.query.lang).slice(0, 8));
+    const r = await fetch(`${GROQ_REST}/audio/transcriptions`, {
+      method: 'POST', headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` }, body: form
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(r.status).json({ success: false, error: data?.error?.message || 'Transcription failed.' });
+    return res.json({ success: true, text: String(data.text || '').trim() });
+  } catch (e) {
+    console.error('STT error:', e.message || e);
+    return res.status(500).json({ success: false, error: e.message || 'Transcription failed.' });
+  }
+});
+
+app.post('/api/tts', async (req, res) => {
+  try {
+    if (!process.env.GROQ_API_KEY) return res.status(401).json({ success: false, error: 'GROQ_API_KEY environment variable is not set.' });
+    const text = String(req.body?.text || req.body?.input || '').trim().slice(0, 200); // Orpheus hard limit is 200 chars
+    if (!text) return res.status(400).json({ success: false, error: "Missing 'text'." });
+    const voice = ORPHEUS_VOICES.includes(req.body?.voice) ? req.body.voice : 'hannah';
+    const r = await fetch(`${GROQ_REST}/audio/speech`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: TTS_MODEL, voice, input: text, response_format: 'wav' })
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      return res.status(r.status).json({ success: false, error: err?.error?.message || 'Speech synthesis failed.' });
+    }
+    res.set({ 'Content-Type': 'audio/wav', 'Cache-Control': 'no-store' });
+    return res.send(Buffer.from(await r.arrayBuffer()));
+  } catch (e) {
+    console.error('TTS error:', e.message || e);
+    return res.status(500).json({ success: false, error: e.message || 'Speech synthesis failed.' });
+  }
+});
 
 // Malformed / oversized request bodies -> clean JSON error instead of a stack trace
 app.use((err, req, res, next) => {
