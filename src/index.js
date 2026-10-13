@@ -13,7 +13,13 @@ const PORT = process.env.PORT || 3000;
 const DEFAULT_MODEL = process.env.GROQ_DEFAULT_MODEL || 'openai/gpt-oss-120b';
 const DEFAULT_MAX_TOKENS = Number(process.env.DEFAULT_MAX_TOKENS) || 1024;
 const HARD_MAX_TOKENS = Number(process.env.HARD_MAX_TOKENS) || 8192;
-const MAX_TOOL_ROUNDS = 3;
+const MAX_TOOL_ROUNDS = 4;
+// ---- Automatic web search: the model decides when to call the web_search tool ----
+const SEARCH_URL = process.env.SEARCH_URL || 'https://tavily-mcp-sse.onrender.com/search'; // Tavily-compatible POST { query, max_results, include_answer }
+const SEARCH_API_KEY = process.env.SEARCH_API_KEY || process.env.TAVILY_API_KEY || ''; // optional; sent as Bearer if set
+const SEARCH_ENABLED = process.env.AUTO_SEARCH !== 'off' && Boolean(SEARCH_URL);
+const MAX_SEARCHES = Number(process.env.MAX_SEARCHES_PER_REQUEST) || 2;
+const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS) || 12000;
 // Provider tokens-per-minute cap that one request (prompt + max_tokens) must fit in. Groq free tier is 8000;
 // raise TPM_BUDGET on paid tiers. Rich UI blocks are long JSON, so history is trimmed before the answer is.
 const TPM_BUDGET = Number(process.env.TPM_BUDGET) || 7600;
@@ -71,7 +77,7 @@ const FILE_HINTS = {
   sensitive: 'medical, legal, financial, mental-health or emotionally heavy topics.'
 };
 
-const TOOLS = PROMPT_FILES.size === 0 ? [] : [{
+const PROMPT_TOOL = {
   type: 'function',
   function: {
     name: 'read_prompt_file',
@@ -82,12 +88,90 @@ const TOOLS = PROMPT_FILES.size === 0 ? [] : [{
       required: ['name']
     }
   }
-}];
+};
 
-function runTool(argsJson) {
+const SEARCH_TOOL = {
+  type: 'function',
+  function: {
+    name: 'web_search',
+    description: 'Search the live web. Call it yourself, without being asked, whenever the answer depends on current or recent facts, or you are unsure or doubt your own knowledge and want to verify it. Write a short, specific query. Do not call it for chit-chat, creative writing, code help, math, or well-established timeless facts.',
+    parameters: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'Concise web search query (max ~12 words)' } },
+      required: ['query']
+    }
+  }
+};
+
+// Tools offered for one request (tasks and opted-out requests get none of the search tool)
+function toolsFor(ctx) {
+  const t = [];
+  if (ctx.useFiles && PROMPT_FILES.size > 0) t.push(PROMPT_TOOL);
+  if (ctx.search) t.push(SEARCH_TOOL);
+  return t;
+}
+
+function runPromptTool(argsJson) {
   let name;
   try { name = JSON.parse(argsJson || '{}').name; } catch {}
   return { name, content: PROMPT_FILES.get(name) ?? `Unknown file. Available: ${[...PROMPT_FILES.keys()].join(', ')}` };
+}
+
+async function runSearchTool(argsJson, ctx) {
+  let query = '';
+  try { query = String(JSON.parse(argsJson || '{}').query || '').trim().slice(0, 300); } catch {}
+  if (!query) return { query, content: 'Search failed: empty query.', sources: [], images: [] };
+  if (ctx.searches >= MAX_SEARCHES) {
+    return { query, content: 'Search limit reached for this reply. Answer with what you already have and say what is unverified.', sources: [], images: [], skipped: true };
+  }
+  ctx.searches++;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
+  try {
+    const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
+    if (SEARCH_API_KEY) headers.Authorization = `Bearer ${SEARCH_API_KEY}`;
+    const r = await fetch(SEARCH_URL, {
+      method: 'POST', headers, signal: controller.signal,
+      body: JSON.stringify({ query, max_results: 5, include_answer: true, include_images: true, include_image_descriptions: true })
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const raw = await r.json();
+    const results = (raw.results || []).slice(0, 5);
+    if (!results.length) return { query, content: `No web results found for "${query}". Say you could not verify this.`, sources: [], images: [] };
+    const clean = t => String(t || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    const sources = results.map(x => ({ title: clean(x.title).slice(0, 120), url: x.url || '', snippet: clean(x.content || x.snippet).slice(0, 180) }));
+    const seen = new Set();
+    const images = (Array.isArray(raw.images) ? raw.images : [])
+      .map(im => typeof im === 'string' ? { url: im } : { url: im?.url, alt: im?.description })
+      .filter(im => /^https:\/\//i.test(im.url || '') && !seen.has(im.url) && seen.add(im.url))
+      .slice(0, 4).map(im => ({ url: im.url, alt: String(im.alt || query).slice(0, 200) }));
+    let content = `WEB SEARCH RESULTS for "${query}" (retrieved ${new Date().toISOString().slice(0, 10)})\n`;
+    if (raw.answer) content += `Direct answer: ${clean(raw.answer).slice(0, 500)}\n`;
+    results.forEach((x, i) => { content += `\n[${i + 1}] ${clean(x.title)}\n${clean(x.content || x.snippet).slice(0, 320)}\nURL: ${x.url}\n`; });
+    content += '\nUse these to answer. Cite sources by name. If they conflict or do not answer the question, say so.';
+    return { query, content, sources, images };
+  } catch (e) {
+    return { query, content: `Web search is unavailable right now (${e.name === 'AbortError' ? 'timeout' : e.message}). Answer from your own knowledge and clearly say it could not be verified live.`, sources: [], images: [], failed: true };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Execute one tool call. Returns { content, event? , sources?, images? }
+async function runTool(call, ctx) {
+  if (call.name === 'web_search') {
+    const r = await runSearchTool(call.args, ctx);
+    return { content: r.content, query: r.query, sources: r.sources, images: r.images, failed: r.failed, isSearch: true };
+  }
+  const r = runPromptTool(call.args);
+  return { content: r.content, name: r.name };
+}
+
+// After tool results are added the prompt grew: keep prompt + max_tokens inside the provider TPM cap
+function refit(options, messages, ctx) {
+  if (ctx.task) return options;
+  const promptTok = Math.ceil(messages.reduce((n, m) => n + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length), 0) / 4);
+  return { ...options, max_tokens: Math.max(512, Math.min(options.max_tokens, TPM_BUDGET - promptTok)) };
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +213,7 @@ CHOOSE BY CONTENT (when content matches, use the block instead of a bullet list,
 - options: you need the user to pick between 2-6 paths before you can continue. form: you need 2+ structured inputs before you can continue. Use both sparingly.
 - follow_up: 2-4 useful next steps. Use <fq> tags OR a follow_up block, never both in one reply.
 - button: only copy (ready-to-use text), insert (put a draft in the user's message box) or open (a real URL).
-- sources: genuine references only. gallery, video, audio, file: ONLY with real full https URLs the user or search results supplied (video/audio: a direct media file URL, not a web page; file: a file the user attached or a real link). You cannot search or fetch media; with no real URL use plain text.
+- sources: genuine references only. gallery, video, audio, file: ONLY with real full https URLs the user or search results supplied (video/audio: a direct media file URL, not a web page; file: a file the user attached or a real link). Never invent media or URLs; use only real URLs from the user or from search results, otherwise plain text.
 - json: a nested structure (API response, config, schema) the user will explore; keep an ordinary json code block when they want code to copy.
 - math: write equations in LaTeX ($x$ inline, $$x$$ display); use a math block only for one prominent standalone formula.
 - zui: the wrapper for types without their own tag (table, json, math): a zui block with an explicit "type".
@@ -169,6 +253,15 @@ const ON_DEMAND = PROMPT_FILES.size > 0
   : `\n\nIDENTITY: If asked who created you, say: "I am developed by NGAI (Nishal Global Artificial Intelligence)." If asked what model powers you, say: "I'm powered by a combination of third-party AI models accessed via API, integrated and branded as SUNSETAI by NGAI." Do not mention this otherwise.`;
 
 const FALLBACK_IDENTITY = `\n\nIDENTITY: If asked who created you, say: "I am developed by NGAI (Nishal Global Artificial Intelligence)." If asked about NGAI, you may add: "NGAI is Nishal's dream company." If asked what model powers you, say: "I'm powered by a combination of third-party AI models accessed via API, integrated and branded as SUNSETAI by NGAI." Do not mention this otherwise.`;
+
+// Appended to the system prompt when the web_search tool is on
+const SEARCH_POLICY = () => `
+
+LIVE WEB SEARCH (you have a web_search tool; today is ${new Date().toISOString().slice(0, 10)})
+- You decide when to search; the user does not have to ask. Search BEFORE answering when the question depends on anything current or changeable (news, prices, scores, releases, versions, who currently holds a role, laws/rules, weather, schedules, "latest/today/now/this year"), asks about a specific person, company, product or event you are not sure about, or when you doubt or cannot confirm a fact you were about to state.
+- Do NOT search for greetings, chit-chat, opinions, creative writing, math, ordinary coding help, rewriting the user's own text, or stable well-known facts.
+- Use a short specific query. One search is usually enough; a second only if the first missed. If the user asks for sources or says "check", "verify", "look up" or "search", always search.
+- Answer from the results, name the source in prose, and never invent URLs. If the results are thin or conflicting, say so. If search fails, say the answer is unverified. Never claim you searched when you did not. The sources and images you were given may be used in sources/gallery blocks; real URLs from results are allowed.`;
 
 const PROMPT_WITH_FILES = CORE_PROMPT + ON_DEMAND;   // Fast / Balanced
 const PROMPT_NO_FILES = CORE_PROMPT + FALLBACK_IDENTITY; // Blazing (no extra round trip)
@@ -237,7 +330,7 @@ app.get(['/', '/health'], (req, res) => {
 });
 
 // Build messages: hardcoded core prompt first, client system messages dropped, history trimmed
-function buildMessages(body, mode, useFiles, systemOverride) {
+function buildMessages(body, mode, useFiles, systemOverride, withSearch) {
   const { prompt, messages } = body;
   let msgs = [];
   if (Array.isArray(messages) && messages.length > 0) {
@@ -249,7 +342,7 @@ function buildMessages(body, mode, useFiles, systemOverride) {
 
   const wantOut = Math.min(Number(body.maxTokens || body.max_tokens) || mode.maxTokens, HARD_MAX_TOKENS);
   const filesTxt = (!systemOverride && typeof body.files === 'string') ? body.files.trim().slice(0, FILES_TOKEN_BUDGET * 4) : '';
-  const sysTok = Math.ceil(((systemOverride ?? (useFiles ? PROMPT_WITH_FILES : PROMPT_NO_FILES)).length + filesTxt.length + (typeof body.context === 'string' ? Math.min(body.context.length, 3000) : 0)) / 4);
+  const sysTok = Math.ceil(((systemOverride ?? (useFiles ? PROMPT_WITH_FILES : PROMPT_NO_FILES)).length + (withSearch ? 900 : 0) + filesTxt.length + (typeof body.context === 'string' ? Math.min(body.context.length, 3000) : 0)) / 4);
   const budget = Number(process.env.HISTORY_TOKEN_BUDGET) || (mode.task ? mode.history : Math.min(mode.history, Math.max(800, TPM_BUDGET - sysTok - wantOut)));
   const size = m => Math.ceil((typeof m.content === 'string' ? m.content : JSON.stringify(m.content)).length / 4);
   const kept = [];
@@ -263,6 +356,7 @@ function buildMessages(body, mode, useFiles, systemOverride) {
   // Optional app context (user profile, preferences, response length, file/search notes) — appended to the system prompt
   const appCtx = typeof body.context === 'string' ? body.context.trim().slice(0, 3000) : '';
   const system = systemOverride ?? (useFiles ? PROMPT_WITH_FILES : PROMPT_NO_FILES) +
+    (withSearch ? SEARCH_POLICY() : '') +
     (appCtx ? `\n\nAPP CONTEXT (user profile and preferences; follow unless they conflict with the core rules above):\n${appCtx}` : '') +
     (filesTxt ? `\n\nATTACHED FILES (the user's uploaded archive/files, already extracted for you and present in every turn; read and use them directly — never ask the user to re-upload; long files may be truncated, say so if relevant):\n${filesTxt}` : '');
   return [{ role: 'system', content: system }, ...kept];
@@ -296,20 +390,23 @@ function sse(res, obj) {
 async function completeWithTools(options, ctx) {
   const messages = [...options.messages];
   const toolsRead = [];
+  const sources = [];
+  const tools = toolsFor(ctx);
   let completion;
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-    const useTools = ctx.useFiles && round < MAX_TOOL_ROUNDS;
-    completion = await createWithRetry({ ...options, messages, ...(useTools && { tools: TOOLS, tool_choice: 'auto' }) }, ctx.fallback);
+    const useTools = tools.length > 0 && round < MAX_TOOL_ROUNDS;
+    completion = await createWithRetry({ ...refit(options, messages, ctx), messages, ...(useTools && { tools, tool_choice: 'auto' }) }, ctx.fallback);
     const msg = completion.choices[0]?.message;
     if (!msg?.tool_calls?.length) break;
     messages.push({ role: 'assistant', content: msg.content ?? null, tool_calls: msg.tool_calls });
     for (const tc of msg.tool_calls) {
-      const r = runTool(tc.function?.arguments);
-      toolsRead.push(r.name);
+      const r = await runTool({ name: tc.function?.name, args: tc.function?.arguments }, ctx);
+      if (r.isSearch) { toolsRead.push(`web_search:${r.query}`); sources.push(...r.sources); }
+      else toolsRead.push(r.name);
       messages.push({ role: 'tool', tool_call_id: tc.id, content: r.content });
     }
   }
-  return { completion, toolsRead };
+  return { completion, toolsRead, sources };
 }
 
 // ---- Smooth character-by-character streaming (SSE) with tool loop ----
@@ -330,6 +427,8 @@ async function streamResponse(req, res, options, ctx) {
   let finishReason = null;
   let model = options.model;
   let stream = null;
+  const tools = toolsFor(ctx);
+  const seenUrls = new Set();
 
   const finish = () => {
     if (closed) return;
@@ -362,10 +461,10 @@ async function streamResponse(req, res, options, ctx) {
     const messages = [...options.messages];
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-      const useTools = ctx.useFiles && round < MAX_TOOL_ROUNDS;
+      const useTools = tools.length > 0 && round < MAX_TOOL_ROUNDS;
       stream = await createWithRetry({
-        ...options, messages, stream: true,
-        ...(useTools && { tools: TOOLS, tool_choice: 'auto' })
+        ...refit(options, messages, ctx), messages, stream: true,
+        ...(useTools && { tools, tool_choice: 'auto' })
       }, ctx.fallback);
 
       const calls = {};
@@ -401,8 +500,18 @@ async function streamResponse(req, res, options, ctx) {
         tool_calls: list.map(c => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.args } }))
       });
       for (const c of list) {
-        const r = runTool(c.args);
-        sse(res, { tool: r.name });
+        if (c.name === 'web_search') {
+          let q = ''; try { q = String(JSON.parse(c.args || '{}').query || ''); } catch {}
+          sse(res, { search: { state: 'start', query: q } });
+        }
+        const r = await runTool({ name: c.name, args: c.args }, ctx);
+        if (closed) return;
+        if (r.isSearch) {
+          const fresh = (r.sources || []).filter(x => x.url && !seenUrls.has(x.url) && seenUrls.add(x.url));
+          sse(res, { search: { state: r.failed ? 'failed' : 'done', query: r.query }, sources: fresh, images: r.images || [] });
+        } else {
+          sse(res, { tool: r.name });
+        }
         messages.push({ role: 'tool', tool_call_id: c.id, content: r.content });
       }
     }
@@ -427,11 +536,13 @@ const handleGenerate = async (req, res) => {
     const mode = task
       ? { ...MODES.fast, task: true, maxTokens: task.maxTokens, history: task.history, files: false, pace: false }
       : MODES[modeName];
-    const ctx = { name: taskName || modeName, useFiles: mode.files && TOOLS.length > 0, fallback: mode.fallback, pace: mode.pace !== false };
+    // Auto web search: chat only (not tasks), unless the client already searched (manual toggle) or opts out with search:false
+    const search = SEARCH_ENABLED && !task && req.body?.search !== false;
+    const ctx = { name: taskName || modeName, task: Boolean(task), useFiles: mode.files && PROMPT_FILES.size > 0, search, searches: 0, fallback: mode.fallback, pace: mode.pace !== false };
     const taskSystem = task
       ? ((typeof req.body.system === 'string' && req.body.system.trim()) ? req.body.system.trim().slice(0, 30000) : task.system)
       : undefined;
-    const groqMessages = buildMessages(req.body || {}, mode, ctx.useFiles, taskSystem);
+    const groqMessages = buildMessages(req.body || {}, mode, ctx.useFiles, taskSystem, ctx.search);
     if (!groqMessages) {
       return res.status(400).json({
         success: false,
@@ -447,7 +558,7 @@ const handleGenerate = async (req, res) => {
       return await streamResponse(req, res, options, ctx);
     }
 
-    const { completion, toolsRead } = await completeWithTools(options, ctx);
+    const { completion, toolsRead, sources } = await completeWithTools(options, ctx);
     const responseText = completion.choices[0]?.message?.content || '';
 
     if (req.query.details === 'true' || req.body.includeDetails) {
@@ -457,6 +568,7 @@ const handleGenerate = async (req, res) => {
         model: completion.model,
         usage: completion.usage || null,
         promptFilesRead: toolsRead,
+        sources,
         executedTools: completion.choices[0]?.message?.executed_tools ?? null
       });
     }
