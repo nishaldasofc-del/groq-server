@@ -5,6 +5,7 @@ import Groq from 'groq-sdk';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { registerResearch } from './research.js';
 
 dotenv.config();
 
@@ -366,6 +367,7 @@ app.get(['/', '/health'], (req, res) => {
     modes: Object.fromEntries(Object.entries(MODES).map(([k, v]) => [k, v.model])),
     tasks: Object.keys(TASKS),
     voice: { stt: STT_MODEL, tts: TTS_MODEL },
+    research: SEARCH_ENABLED,
     promptFiles: [...PROMPT_FILES.keys()],
     richBlocks: 1,
     hasApiKey: Boolean(process.env.GROQ_API_KEY)
@@ -703,6 +705,12 @@ app.post('/api/tts', async (req, res) => {
     console.error('TTS error:', e.message || e);
     return res.status(500).json({ success: false, error: e.message || 'Speech synthesis failed.' });
   }
+});
+
+// Research reports (plan -> search -> read -> write sections -> assemble), streamed over SSE
+registerResearch(app, {
+  createWithRetry, retryAfterMs, sleep, MODES,
+  search: { url: SEARCH_URL, key: SEARCH_API_KEY, timeoutMs: Math.max(SEARCH_TIMEOUT_MS, 20000), depth: process.env.RESEARCH_SEARCH_DEPTH || 'basic' }
 });
 
 // Malformed / oversized request bodies -> clean JSON error instead of a stack trace
