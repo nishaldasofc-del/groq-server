@@ -44,7 +44,7 @@ const TASKS = {
   draw:  { maxTokens: 5000, history: 0,    system: 'You are an illustration generator. Follow the user instructions exactly and output only what they ask for (raw HTML with inline SVG).' },
   quiz:  { maxTokens: 3500, history: 0,    system: 'You are a quiz generator. Output only valid JSON. No explanation, no markdown, no prose.' },
   agent: { maxTokens: 5000, history: 3500, system: 'You are SUNSETAI, an advanced coding agent.' },
-  voice: { maxTokens: 512,  history: 3500, model: process.env.MODEL_VOICE || 'llama-3.3-70b-versatile', system: 'You are SunsetAI, an intelligent voice assistant by NGAI. Be conversational and concise: 2-4 sentences unless detail is needed. No markdown in responses. Speak naturally as if in conversation.' },
+  voice: { maxTokens: 512,  history: 3500, model: process.env.MODEL_VOICE || 'openai/gpt-oss-20b', fallback: ['openai/gpt-oss-120b'], system: 'You are SunsetAI, an intelligent voice assistant by NGAI. Be conversational and concise: 2-4 sentences unless detail is needed. No markdown in responses. Speak naturally as if in conversation.' },
   title: { maxTokens: 40,   history: 0,    system: 'You write short chat titles. Output only the title, nothing else.' }
 };
 
@@ -344,6 +344,8 @@ async function createWithRetry(options, fallbacks = FALLBACK_MODELS) {
         return await getGroqClient().chat.completions.create(opts);
       } catch (e) {
         lastErr = e;
+        const modelGone = (e.status === 404 || e.status === 400) && /model|decommission|not found|does not exist/i.test(e.message || '');
+        if (modelGone) { console.warn(`Model ${model} unavailable: ${e.message}`); break; }
         if (e.status !== 429) throw e;
         const wait = retryAfterMs(e);
         if (attempt === 0 && wait <= 2000) { await sleep(wait + 50); continue; }
@@ -597,7 +599,7 @@ const handleGenerate = async (req, res) => {
     const task = taskName ? TASKS[taskName] : null;
     // A task borrows the Fast model but has its own token budget, raw system prompt, no files, no pacing
     const mode = task
-      ? { ...MODES.fast, ...(task.model && { model: task.model }), task: true, maxTokens: task.maxTokens, history: task.history, files: false, pace: false }
+      ? { ...MODES.fast, ...(task.model && { model: task.model }), ...(task.fallback && { fallback: task.fallback }), task: true, maxTokens: task.maxTokens, history: task.history, files: false, pace: false }
       : MODES[modeName];
     // Auto web search: chat only (not tasks), unless the client already searched (manual toggle) or opts out with search:false
     const search = SEARCH_ENABLED && !task && req.body?.search !== false;
