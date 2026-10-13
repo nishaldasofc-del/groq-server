@@ -14,14 +14,17 @@ const DEFAULT_MODEL = process.env.GROQ_DEFAULT_MODEL || 'openai/gpt-oss-120b';
 const DEFAULT_MAX_TOKENS = Number(process.env.DEFAULT_MAX_TOKENS) || 1024;
 const HARD_MAX_TOKENS = Number(process.env.HARD_MAX_TOKENS) || 8192;
 const MAX_TOOL_ROUNDS = 3;
+// Provider tokens-per-minute cap that one request (prompt + max_tokens) must fit in. Groq free tier is 8000;
+// raise TPM_BUDGET on paid tiers. Rich UI blocks are long JSON, so history is trimmed before the answer is.
+const TPM_BUDGET = Number(process.env.TPM_BUDGET) || 7600;
 
 // ---------------------------------------------------------------------------
 // Modes (the app sends only { mode }, everything else is decided here)
 // ---------------------------------------------------------------------------
 const MODES = {
-  blazing:  { model: process.env.MODEL_BLAZING  || 'openai/gpt-oss-20b',  fallback: ['openai/gpt-oss-120b'], effort: 'low',    maxTokens: 512,  history: 1200, files: false, pace: false },
-  fast:     { model: process.env.MODEL_FAST     || 'openai/gpt-oss-120b', fallback: ['openai/gpt-oss-20b'],  effort: 'low',    maxTokens: 1024, history: 2000, files: true,  pace: true },
-  balanced: { model: process.env.MODEL_BALANCED || 'openai/gpt-oss-120b', fallback: ['openai/gpt-oss-20b'],  effort: 'medium', maxTokens: 2048, history: 3000, files: true,  pace: true }
+  blazing:  { model: process.env.MODEL_BLAZING  || 'openai/gpt-oss-20b',  fallback: ['openai/gpt-oss-120b'], effort: 'low',    maxTokens: 1024, history: 1200, files: false, pace: false },
+  fast:     { model: process.env.MODEL_FAST     || 'openai/gpt-oss-120b', fallback: ['openai/gpt-oss-20b'],  effort: 'low',    maxTokens: 2048, history: 2000, files: true,  pace: true },
+  balanced: { model: process.env.MODEL_BALANCED || 'openai/gpt-oss-120b', fallback: ['openai/gpt-oss-20b'],  effort: 'medium', maxTokens: 3072, history: 3000, files: true,  pace: true }
 };
 const DEFAULT_MODE = 'balanced';
 
@@ -100,30 +103,34 @@ OUTPUT TAGS (the app parses these; never mention them to the user)
 1. PLAN: if a request involves multiple files, pages, sections or steps, or output longer than ~30 lines, begin the response with <plan>2-4 line plan</plan> before anything else. Skip it for small single-step requests.
 2. FOLLOW-UPS: if the answer is more than a couple of sentences, end with 1-2 relevant follow-ups. Each is its own tag: the text inside is a short question to the user (shown on a button), and the a attribute is the reply the USER sends when they tap it, written in the user's own first-person voice as a clear answer or request, e.g. <fq a="Yes, add more impressive animations">Want more animation?</fq>. Never repeat the question as the reply, and never put double quotes inside the attribute. Put all <fq> tags at the very end. Skip for one-line answers.
 
-RICH UI BLOCKS (the app renders these; you choose them yourself, automatically)
-Default to ordinary Markdown. Add a block ONLY when it makes the answer clearly easier to scan or use than prose or a Markdown table would. Most replies need none. Never use a block for a one-line answer, chit-chat, opinions, emotional topics, or ordinary code help. Use at most 2-3 blocks per reply, always with a short plain-text lead-in, and never wrap the whole answer in a block.
+RICH UI BLOCKS (the app renders these; you choose them yourself, automatically; the user never has to ask for a visual)
+A block is a fenced code block: the block type right after the opening backticks, then ONE JSON object (diagram: plain Mermaid text). Use blocks the way a good designer would: when structure makes an answer faster to scan, compare, follow or act on than prose.
+- Stay in plain text/Markdown for chit-chat, quick facts, one-line answers, opinions, emotional or sensitive topics, ordinary code help, and anything a short paragraph covers.
+- Substantial explanations, multi-part comparisons, tutorials, troubleshooting, research summaries, study plans and plans/schedules should normally include the fitting component(s), each introduced by a short plain-text lead-in.
+- No fixed count: use as many blocks as genuinely help (usually 1-2; a rich multi-part guide may use more), different types for different parts. Never repeat the same content in prose and in a block, never wrap the whole answer in one block, never add a block as decoration.
+- Never invent data, numbers, sources, URLs, files, media, playback state, progress or interactions. Only the fields listed below exist.
 
-CHOOSE BY CONTENT. When the content matches a trigger below you MUST use that block instead of a bullet list, numbered list or run-on paragraph (this overrides the "plain sentences" rule above); otherwise use plain Markdown:
-- explainer: the user asks you to EXPLAIN how something works or is structured, and it has 3-6 distinct parts or stages (a pipeline, system, lifecycle, process, anatomy, concept with layers). It is an interactive lesson: stage list plus tap-to-explore tiles with a detail panel. Prefer it over a long numbered list for "explain / how does X work" questions about multi-part things. Give each stage a short summary AND a fuller "detail" (2-4 sentences, Markdown ok), optional "points".
-- quiz: the user asks to be quizzed or tested (3-6 multiple-choice questions, "answer" = zero-based index of the correct option, short "explanation").
-- flashcards: the user wants to study, memorise or revise terms (4-12 cards with "front" and "back").
-- plot: a relationship where changing inputs changes a curve (compound interest, projectile motion, supply and demand, growth). Sliders drive the formula; x is the horizontal range.
-- steps: ANY how-to, setup, install, recipe or procedure with 4+ ordered actions (e.g. "how do I set up X").
-- checklist: ANY list of things to pack, bring, buy, prepare or tick off (packing lists, trip prep, audits, to-dos), even when the question is short.
-- callout: ONE important warning, tip or key takeaway worth setting apart (tone: info|success|warn|danger).
-- metrics: 2-6 headline numbers the user gave you or that are stable, well-known facts (use "spark":[numbers] only for a real series).
-- kv: a spec sheet or profile of one thing (device specs, plan details, a person's facts).
-- card: 2-6 distinct options or recommendations with their own attributes (tools, books, places, plans).
-- timeline: 4+ chronological events (history, roadmap, project plan).
-- tabs: 2-4 parallel alternatives of the same thing (same code in Python/JS, beginner vs advanced, plan A/B).
-- accordion: 3+ independent FAQ-style questions or optional details.
-- progress: values that are percentages or levels (skill levels, completion, budget used).
-- chart: real numbers the user supplied or well-established data you state as such; never invent data. If numbers are illustrative, say so in the lead-in.
-- diagram (Mermaid): a process, workflow, architecture or relationships with 4+ nodes.
-- calculator: the user needs to compute with their own numbers (EMI, BMI, split bill, conversion).
-- options / form: only when you must collect a choice or a few inputs before you can continue.
-- Markdown table (not a block): comparisons of 3+ items by 3+ attributes.
-- gallery, video, audio, file, sources: ONLY with real, full https URLs the user or search results supplied. Never invent URLs, images, sources, citations, files or statistics. You cannot search the web or fetch images yourself; if no real URL exists, use plain text.
+CHOOSE BY CONTENT (when content matches, use the block instead of a bullet list, numbered list or run-on paragraph; this overrides the plain-sentences rule above):
+- steps: any how-to, setup, install, recipe, fix or procedure with 3+ ordered actions.
+- checklist: things to pack, bring, buy, prepare, audit or tick off; to-dos, even when the question is short.
+- explainer: "explain how X works" for something with 3-6 stages or layers (pipeline, system, lifecycle, anatomy). An interactive lesson with tap-to-explore tiles; prefer it to a long numbered list. Give each stage a short "summary" AND a fuller "detail" (2-4 sentences, Markdown ok), optional "points".
+- diagram: a process, workflow, architecture or relationships with 4+ nodes (Mermaid).
+- timeline: 4+ chronological events (history, roadmap, week-by-week study plan, project schedule).
+- table: comparison of 3+ items by 3+ attributes, or tabular data. A Markdown table is fine up to about 10 rows; use a zui table for longer data.
+- card: 2-6 distinct options or recommendations that each have their own attributes (tools, books, places, plans).
+- tabs: parallel variants of one thing (same code in two languages, OS A/B, beginner vs advanced). accordion: 3+ independent FAQ-style items or optional details.
+- callout: ONE important warning, safety note, tip or key takeaway worth setting apart (tone: info|success|warn|danger).
+- metrics: 2-6 headline numbers the user gave you or that are stable, well-known facts (spark only for a real series). kv: a spec sheet or profile of one thing.
+- progress: real percentages or levels the user gave (completion, budget used, skill level). Never make progress up.
+- plot: a relationship where changing inputs changes a curve (compound interest, projectile motion, supply and demand). calculator: the user must compute with their own numbers (EMI, BMI, bill split, conversion). chart: real numbers the user supplied or well-established data you label as such; if illustrative, say so in the lead-in.
+- quiz: the user wants to be tested. flashcards: the user wants to study or memorise terms. When teaching a topic, offering one of these as a follow-up is good.
+- options: you need the user to pick between 2-6 paths before you can continue. form: you need 2+ structured inputs before you can continue. Use both sparingly.
+- follow_up: 2-4 useful next steps. Use <fq> tags OR a follow_up block, never both in one reply.
+- button: only copy (ready-to-use text), insert (put a draft in the user's message box) or open (a real URL).
+- sources: genuine references only. gallery, video, audio, file: ONLY with real full https URLs the user or search results supplied (video/audio: a direct media file URL, not a web page; file: a file the user attached or a real link). You cannot search or fetch media; with no real URL use plain text.
+- json: a nested structure (API response, config, schema) the user will explore; keep an ordinary json code block when they want code to copy.
+- math: write equations in LaTeX ($x$ inline, $$x$$ display); use a math block only for one prominent standalone formula.
+- zui: the wrapper for types without their own tag (table, json, math): a zui block with an explicit "type".
 
 EXAMPLE (user asks what to pack for 3 days in Goa): one friendly sentence, then
 \`\`\`checklist
@@ -133,19 +140,24 @@ EXAMPLE (user asks how to set up a Python venv): one sentence, then
 \`\`\`steps
 {"v":1,"title":"Set up a virtual environment","items":[{"title":"Create it","description":"Run python -m venv .venv"},{"title":"Activate it","description":"Windows: .venv/Scripts/activate. macOS/Linux: source .venv/bin/activate"},{"title":"Install packages","description":"pip install requests"},{"title":"Leave it","description":"Run deactivate"}]}
 \`\`\`
+EXAMPLE (zui wrapper): \`\`\`zui
+{"v":1,"type":"table","title":"Plans","columns":["Plan","Price"],"rows":[["Free","$0"],["Pro","$12"]]}
+\`\`\`
 
-FORMAT (strict): put the block type directly after the opening backticks (\`\`\`metrics, never a bare \`\`\`), put only valid JSON inside (no comments, no trailing commas, no HTML), include "v":1, keep it compact. Shapes:
+FORMAT (strict): block type directly after the opening backticks (\`\`\`metrics, never a bare \`\`\`), only valid JSON inside (no comments, no trailing commas, no raw line breaks inside strings: write \\n; no HTML), include "v":1, close every block with its own line of three backticks, keep each block compact, and never nest one inside another fence or a list. Shapes:
 - explainer {title,badge?,subtitle?,stages:[{title,summary,detail,icon?,tone?,short?,tagline?,points?:[...]}]} (2-8 stages; icon = one of: chat phone server cpu layout search database code lock cloud chart file user globe bolt book image bell check star heart home cart clock map mail shield key layers sparkle target flask wifi tool; tone = orange|blue|purple|green|pink|teal)
-- quiz {title?,questions:[{question,options:["..."],answer:0,explanation?}]}; flashcards {title?,cards:[{front,back}]}
+- quiz {title?,questions:[{question,options:["..."],answer:0,explanation?}]} (3-6 multiple-choice; "answer" = zero-based index of the correct option); flashcards {title?,cards:[{front,back}]} (4-12 cards)
 - plot {title,x:{name,min,max,label?,points?},y_label?,inputs:[{name,label,min,max,value,step?,unit?}],series:[{label,formula}]} (formula uses x and input names with + - * / ^ % parentheses and min max round abs sqrt floor ceil pow only)
 - steps {title?,items:[{title,description?}]}; checklist {title?,items:["text"|{text,done?}]}; callout {tone,title?,text}
 - metrics {items:[{label,value,delta?,note?,icon?,tone?,spark?}]}; kv {items:[{key,value}]}; progress {items:[{label,value,max?}]}; timeline {events:[{date,title,description?}]}
-- card {items:[{title,subtitle?,description?,icon? (one emoji or an icon name above),badge?,tone?,tags?:[...],facts?:[{key,value}],url?}]}  (icon = one emoji; tone = info|success|warn|danger|neutral)
+- card {items:[{title,subtitle?,description?,icon? (one emoji or an icon name above),badge?,tags?:[...],facts?:[{key,value}],url?}]} (tone = info|success|warn|danger|neutral)
 - accordion {items:[{title,content}]}; tabs {tabs:[{label,content}]} (content is Markdown)
 - calculator {inputs:[{name,label,value,min?,max?,unit?}],outputs:[{label,formula,unit?,decimals?}]} (formula: + - * / ^ % parentheses, min max round abs sqrt floor ceil pow, input names only)
-- options {question,options:[{label,description?,message?}]}; form {fields:[{name,label,type:text|textarea|select|checkbox|radio|slider|number,options?,required?}]}
+- options {question,options:[{label,description?,message?}]}; form {title?,fields:[{name,label,type:text|textarea|select|checkbox|radio|slider|number,options?,required?,min?,max?}],submit?:{label,action:insert|copy}}
+- follow_up {items:["question"|{label,message?}]}; button {title?,buttons:[{label,action:copy|insert|open,text?,url?}]}
 - chart {type:bar|line|area|pie|doughnut|scatter,title?,labels:[...],datasets:[{label,data:[numbers]}]}
-- sources {items:[{title,url,snippet?}]}; gallery {images:[{url,alt,caption?,attribution?,source_url?}]}; video/audio {url,caption?}; file {name,url,size?}
+- sources {items:[{title,url,snippet?}]}; gallery {images:[{url,alt,caption?,attribution?,source_url?}]}; video/audio {url,title?,caption?}; file {name,url?,size? (bytes),type?}
+- zui {v:1,type:"table",columns:["A","B"],rows:[["x","y"]]}, {type:"json",data:<any JSON>}, {type:"math",tex:"..."}
 - diagram: plain Mermaid text (no directives, no HTML).
 Use [n] inline citations only when a sources block lists those numbers.`;
 
@@ -233,7 +245,9 @@ function buildMessages(body, mode, useFiles, systemOverride) {
   }
   if (msgs.length === 0) return null;
 
-  const budget = Number(process.env.HISTORY_TOKEN_BUDGET) || mode.history;
+  const wantOut = Math.min(Number(body.maxTokens || body.max_tokens) || mode.maxTokens, HARD_MAX_TOKENS);
+  const sysTok = Math.ceil(((systemOverride ?? (useFiles ? PROMPT_WITH_FILES : PROMPT_NO_FILES)).length + (typeof body.context === 'string' ? Math.min(body.context.length, 3000) : 0)) / 4);
+  const budget = Number(process.env.HISTORY_TOKEN_BUDGET) || (mode.task ? mode.history : Math.min(mode.history, Math.max(800, TPM_BUDGET - sysTok - wantOut)));
   const size = m => Math.ceil((typeof m.content === 'string' ? m.content : JSON.stringify(m.content)).length / 4);
   const kept = [];
   let used = 0;
@@ -255,11 +269,13 @@ function buildOptions(body, groqMessages, mode) {
   const model = mode.model;
   const temp = Number(temperature);
   const requested = mode.task ? mode.maxTokens : (Number(maxTokens || max_tokens) || mode.maxTokens);
+  const promptTok = Math.ceil(groqMessages.reduce((n, m) => n + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length), 0) / 4);
+  const room = mode.task ? Infinity : Math.max(1024, TPM_BUDGET - promptTok);
   const options = {
     messages: groqMessages,
     model,
     temperature: Number.isFinite(temp) ? Math.min(Math.max(temp, 0), 2) : 0.7,
-    max_tokens: Math.min(Math.max(1, requested), HARD_MAX_TOKENS)
+    max_tokens: Math.min(Math.max(1, requested), HARD_MAX_TOKENS, room)
   };
   if (String(model).startsWith('openai/gpt-oss')) {
     options.reasoning_effort = mode.effort;
@@ -307,6 +323,7 @@ async function streamResponse(req, res, options, ctx) {
   let upstreamDone = false;
   let closed = false;
   let usage = null;
+  let finishReason = null;
   let model = options.model;
   let stream = null;
 
@@ -314,7 +331,7 @@ async function streamResponse(req, res, options, ctx) {
     if (closed) return;
     closed = true;
     clearInterval(timer);
-    sse(res, { done: true, mode: ctx.name, model, usage });
+    sse(res, { done: true, mode: ctx.name, model, usage, finish_reason: finishReason });
     res.write('data: [DONE]\n\n');
     res.end();
   };
@@ -353,6 +370,7 @@ async function streamResponse(req, res, options, ctx) {
         if (closed) return;
         model = chunk.model || model;
         const d = chunk.choices?.[0]?.delta;
+        if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
         if (d?.content) { text += d.content; if (ctx.pace) queue.push(...d.content); else sse(res, { delta: d.content }); }
         for (const tc of d?.tool_calls || []) {
           const c = (calls[tc.index ?? 0] ??= { id: '', name: '', args: '' });
