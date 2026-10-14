@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { registerResearch } from './research.js';
+import { createStoryHandler } from './story.js';
 
 dotenv.config();
 
@@ -370,6 +371,7 @@ app.get(['/', '/health'], (req, res) => {
     research: SEARCH_ENABLED,
     promptFiles: [...PROMPT_FILES.keys()],
     richBlocks: 1,
+    story: 1,
     hasApiKey: Boolean(process.env.GROQ_API_KEY)
   });
 });
@@ -594,7 +596,21 @@ async function streamResponse(req, res, options, ctx) {
   }
 }
 
+// Visual Storytelling Mode: task:'story' is handled by ./story.js (structured scene JSON over the same SSE framing)
+const handleStory = createStoryHandler({
+  createWithRetry, tpmBudget: TPM_BUDGET,
+  getModel: () => MODES.balanced.model, getFallback: () => MODES.balanced.fallback
+});
+
 const handleGenerate = async (req, res) => {
+  if (String(req.body?.task || '').toLowerCase() === 'story') {
+    try { return await handleStory(req, res); }
+    catch (error) {
+      console.error('Story handler error:', error.message || error);
+      if (res.headersSent) return res.end();
+      return res.status(500).json({ success: false, error: error.message || 'Story generation failed.' });
+    }
+  }
   try {
     const modeName = MODES[String(req.body?.mode || '').toLowerCase()] ? String(req.body.mode).toLowerCase() : DEFAULT_MODE;
     const taskName = TASKS[String(req.body?.task || '').toLowerCase()] ? String(req.body.task).toLowerCase() : null;
