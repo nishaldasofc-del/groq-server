@@ -107,11 +107,45 @@ const SEARCH_TOOL = {
   }
 };
 
+// ---- User report (personalisation): fetched on demand, never sent with every message ----
+const REPORT_API_URL = (process.env.REPORT_API_URL_BASE || 'https://zenoai-bot.vercel.app').replace(/\/+$/, '');
+const REPORT_TOOL = {
+  type: 'function',
+  function: {
+    name: 'read_user_report',
+    description: "Read the saved profile report about THIS user (summary, interests, preferred response style) built from their earlier chats. Call it when the user asks about themselves or what you know about them, refers to their own interests/background/preferences, or when a personal detail would clearly improve the answer and it is NOT already in this conversation. Do not call it for generic questions. Never tell the user a 'report' exists; just use what it says.",
+    parameters: { type: 'object', properties: {} }
+  }
+};
+async function runReportTool(ctx) {
+  if (ctx.reportCache) return ctx.reportCache;
+  let out = 'No saved profile is available for this user. Do not guess personal details; ask them if it matters.';
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 4000);
+    const r = await fetch(REPORT_API_URL + '/api/profile', { method: 'POST', headers: { Authorization: 'Bearer ' + ctx.reportAuth }, signal: ctrl.signal });
+    clearTimeout(t);
+    if (r.ok) {
+      const j = await r.json();
+      const rep = j && j.report;
+      if (rep && (rep.summary || (rep.interests || []).length || (rep.communicationPreferences || []).length)) {
+        out = ['SAVED USER PROFILE (use naturally; never invent details beyond this):',
+          rep.summary ? 'About: ' + rep.summary : '',
+          (rep.interests || []).length ? 'Interests: ' + rep.interests.join('; ') : '',
+          (rep.communicationPreferences || []).length ? 'Preferred response style: ' + rep.communicationPreferences.join('; ') : ''
+        ].filter(Boolean).join('\n');
+      }
+    } else console.warn('report fetch http', r.status);
+  } catch (e) { console.warn('report fetch failed:', e.message); }
+  return (ctx.reportCache = out);
+}
+
 // Tools offered for one request (tasks and opted-out requests get none of the search tool)
 function toolsFor(ctx) {
   const t = [];
   if (ctx.useFiles && PROMPT_FILES.size > 0) t.push(PROMPT_TOOL);
   if (ctx.search) t.push(SEARCH_TOOL);
+  if (ctx.reportAuth) t.push(REPORT_TOOL);
   return t;
 }
 
@@ -178,6 +212,7 @@ async function runTool(call, ctx) {
     const r = await runSearchTool(call.args, ctx);
     return { content: r.content, query: r.query, sources: r.sources, images: r.images, failed: r.failed, isSearch: true };
   }
+  if (call.name === 'read_user_report') return { content: await runReportTool(ctx), name: 'read_user_report' };
   const r = runPromptTool(call.args);
   return { content: r.content, name: r.name };
 }
@@ -622,7 +657,8 @@ const handleGenerate = async (req, res) => {
       : MODES[modeName];
     // Auto web search: chat only (not tasks), unless the client already searched (manual toggle) or opts out with search:false
     const search = SEARCH_ENABLED && !task && req.body?.search !== false;
-    const ctx = { name: taskName || modeName, task: Boolean(task), useFiles: mode.files && PROMPT_FILES.size > 0, search, searches: 0, fallback: mode.fallback, pace: mode.pace !== false };
+    const reportAuth = (!task && typeof req.body?.reportAuth === 'string' && req.body.reportAuth.length > 100 && req.body.reportAuth.length < 4000) ? req.body.reportAuth : '';
+    const ctx = { reportAuth, name: taskName || modeName, task: Boolean(task), useFiles: mode.files && PROMPT_FILES.size > 0, search, searches: 0, fallback: mode.fallback, pace: mode.pace !== false };
     const taskSystem = task
       ? ((typeof req.body.system === 'string' && req.body.system.trim()) ? req.body.system.trim().slice(0, 30000) : task.system)
       : undefined;
