@@ -47,6 +47,7 @@ const TASKS = {
   quiz:  { maxTokens: 3500, history: 0,    system: 'You are a quiz generator. Output only valid JSON. No explanation, no markdown, no prose.' },
   agent: { maxTokens: 5000, history: 3500, system: 'You are SUNSETAI, an advanced coding agent.' },
   voice: { maxTokens: 512,  history: 3500, model: process.env.MODEL_VOICE || 'openai/gpt-oss-20b', fallback: ['openai/gpt-oss-120b'], system: 'You are SunsetAI, an intelligent voice assistant by NGAI. Be conversational and concise: 2-4 sentences unless detail is needed. No markdown in responses. Speak naturally as if in conversation.' },
+  report: { maxTokens: 700, history: 0,   system: 'You output only a single valid JSON object. No explanation, no markdown, no prose.' },
   title: { maxTokens: 40,   history: 0,    system: 'You write short chat titles. Output only the title, nothing else.' }
 };
 
